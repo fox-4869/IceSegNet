@@ -1,0 +1,165 @@
+import torch
+import torch.nn as nn
+from mmcv.cnn import ConvModule, DepthwiseSeparableConvModule
+from mmseg.registry import MODELS
+from ..utils import resize
+from .decode_head import BaseDecodeHead
+from .psp_head import PPM
+
+# 定义论文中的 Patch-Enhanced Attention 模块
+class PatchEnhancedAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super(PatchEnhancedAttention, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))  # 水平方向池化
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))  # 垂直方向池化
+        mid_channels = max(8, in_channels // reduction)
+
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0)
+        self.conv2 = nn.Conv2d(mid_channels, in_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        # 水平注意力
+        identity = x
+        h = self.pool_h(x).permute(0, 1, 3, 2)  # (N, C, W, H)
+        h = self.conv1(h).relu()
+        h = self.conv2(h).sigmoid().permute(0, 1, 3, 2)  # 恢复形状
+
+        # 垂直注意力
+        w = self.pool_w(x)
+        w = self.conv1(w).relu()
+        w = self.conv2(w).sigmoid()
+
+        # 输出结合水平和垂直注意力
+        out = identity * h * w
+        return out
+
+
+@MODELS.register_module()
+class UPerATTHead(BaseDecodeHead):
+    """Unified Perceptual Parsing for Scene Understanding using Depthwise Separable Convolutions in FPN."""
+
+    def __init__(self, pool_scales=(1, 2, 3, 6), **kwargs):
+        super().__init__(input_transform='multiple_select', **kwargs)
+
+        # PSP Module
+        self.psp_modules = PPM(
+            pool_scales,
+            self.in_channels[-1],
+            self.channels,
+            conv_cfg=self.conv_cfg,
+            norm_cfg=self.norm_cfg,
+            act_cfg=self.act_cfg,
+            align_corners=self.align_corners)
+
+        # Bottleneck with standard convolution
+        self.bottleneck = ConvModule(
+            self.in_channels[-1] + len(pool_scales) * self.channels,
+            self.channels,
+            kernel_size=3,
+            padding=1,
+            conv_cfg=self.conv_cfg,
+            norm_cfg=self.norm_cfg,
+            act_cfg=self.act_cfg
+        )
+
+        # FPN Module with depthwise separable convolutions
+        self.lateral_convs = nn.ModuleList()
+        self.fpn_convs = nn.ModuleList()
+        self.pea_layers = nn.ModuleList()  # 添加 PEA 模块
+        for in_channels in self.in_channels[:-1]:  # skip the top layer
+            l_conv = DepthwiseSeparableConvModule(
+                in_channels,
+                self.channels,
+                kernel_size=1,  # 注意：1x1卷积可以直接使用普通卷积
+                norm_cfg=self.norm_cfg,
+                act_cfg=self.act_cfg,
+                inplace=False)
+
+            fpn_conv = DepthwiseSeparableConvModule(
+                self.channels,
+                self.channels,
+                kernel_size=3,
+                padding=1,
+                norm_cfg=self.norm_cfg,
+                act_cfg=self.act_cfg,
+                inplace=False
+            )
+
+            self.lateral_convs.append(l_conv)
+            self.fpn_convs.append(fpn_conv)
+            self.pea_layers.append(PatchEnhancedAttention(self.channels))  # 为每层FPN添加PEA
+
+        self.fpn_bottleneck = DepthwiseSeparableConvModule(
+            len(self.in_channels) * self.channels,
+            self.channels,
+            kernel_size=3,
+            padding=1,
+            norm_cfg=self.norm_cfg,
+            act_cfg=self.act_cfg
+        )
+
+    def psp_forward(self, inputs):
+        """Forward function of PSP module."""
+        x = inputs[-1]
+        psp_outs = [x]
+        psp_outs.extend(self.psp_modules(x))
+        psp_outs = torch.cat(psp_outs, dim=1)
+        output = self.bottleneck(psp_outs)  # 使用标准卷积的 bottleneck
+
+        return output
+
+    def _forward_feature(self, inputs):
+        """Forward function for feature maps before classifying each pixel with
+        ``self.cls_seg`` fc.
+
+        Args:
+            inputs (list[Tensor]): List of multi-level img features.
+
+        Returns:
+            feats (Tensor): A tensor of shape (batch_size, self.channels,
+                H, W) which is feature map for last layer of decoder head.
+        """
+        inputs = self._transform_inputs(inputs)
+
+        # build laterals
+        laterals = [
+            lateral_conv(inputs[i])
+            for i, lateral_conv in enumerate(self.lateral_convs)
+        ]
+
+        laterals.append(self.psp_forward(inputs))
+
+        # build top-down path
+        used_backbone_levels = len(laterals)
+        for i in range(used_backbone_levels - 1, 0, -1):
+            prev_shape = laterals[i - 1].shape[2:]
+            laterals[i - 1] = laterals[i - 1] + resize(
+                laterals[i],
+                size=prev_shape,
+                mode='bilinear',
+                align_corners=self.align_corners)
+
+        # build outputs
+        fpn_outs = [
+            self.pea_layers[i](self.fpn_convs[i](laterals[i]))  # 在 FPN 输出上应用 PEA
+            for i in range(used_backbone_levels - 1)
+        ]
+        # append psp feature
+        fpn_outs.append(laterals[-1])
+
+        for i in range(used_backbone_levels - 1, 0, -1):
+            fpn_outs[i] = resize(
+                fpn_outs[i],
+                size=fpn_outs[0].shape[2:],
+                mode='bilinear',
+                align_corners=self.align_corners)
+        
+        fpn_outs = torch.cat(fpn_outs, dim=1)
+        feats = self.fpn_bottleneck(fpn_outs)
+        return feats
+
+    def forward(self, inputs):
+        """Forward function."""
+        output = self._forward_feature(inputs)
+        output = self.cls_seg(output)
+        return output
