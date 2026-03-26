@@ -248,8 +248,7 @@ IceSegNet/
 │   └── uper_att_plus_head.py      # UPerSCA-MTL decode head
 ├── tools/                         # Training & testing scripts (MMSeg)
 ├── README.md                      # English README
-├── README_CN.md                   # Chinese README
-└── requirements.txt
+└── README_CN.md                   # Chinese README
 ```
 
 ---
