@@ -40,7 +40,7 @@ Evaluated on two Yellow River ice datasets — NWPU_YRCC2 (1525 images, 4 classe
 
 ## 🏗️ Architecture
 
-![Model Architecture](IceSegNet.png)
+![Model Architecture](IceSegNet_model.png)
 
 ### Stage-Aware Kernel Update
 
