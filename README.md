@@ -40,42 +40,7 @@ Evaluated on two Yellow River ice datasets — NWPU_YRCC2 (1525 images, 4 classe
 
 ## 🏗️ Architecture
 
-```
-Input Image
-    │
-    ▼
-┌─────────────────────────────────────────────────┐
-│           Backbone: Swin Transformer-L           │
-│  Stage 1 (×2) → Stage 2 (×2) → Stage 3 (×18)  │
-│  C1: 192ch    C2: 384ch    C3: 768ch            │
-│                                    C4: 1536ch    │
-└─────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────┐
-│            Neck: SEFPN (Normalized FPN)          │
-│    1×1 conv + 3×3+BN+ReLU → P1~P4: 768ch each  │
-└─────────────────────────────────────────────────┘
-    │                   │
-    ▼                   ▼
-┌──────────┐  ┌──────────────────────────────────────┐
-│ Auxiliary │  │            Decode Head               │
-│   Head   │  │                                      │
-│  (CFCN)  │  │  ┌───────────────────────────────┐  │
-└──────────┘  │  │  Kernel Generate: UPerSCA-MTL  │  │
-              │  │  (PPM + SCA + DepthwiseSepConv │  │
-              │  │   + Multi-Task Output Head)    │  │
-              │  └───────────────────────────────┘  │
-              │               │                      │
-              │               ▼                      │
-              │  ┌───────────────────────────────┐  │
-              │  │   Stage-Aware Kernel Update    │  │
-              │  │  Stage I:   FFN width = 2048   │  │
-              │  │  Stage II:  FFN width = 1024   │  │
-              │  │  Stage III: FFN width = 512    │  │
-              │  └───────────────────────────────┘  │
-              └──────────────────────────────────────┘
-```
+![Model Architecture](IceSegNet.png)
 
 ### Stage-Aware Kernel Update
 
